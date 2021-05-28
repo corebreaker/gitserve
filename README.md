@@ -1,6 +1,9 @@
 # gitserve
+_A little http server for Git_
 
-_A little git http server_
+This can be useful to get easily a little http server locally to server its own repository without register its repo on a public Git server like Github/Gitlab.
+You can also put published repo in a USB key.
+
 
 ## Installation
 ```bash
