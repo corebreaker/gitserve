@@ -1,6 +1,6 @@
 # gitserve
 
-** A little git http server **
+_A little git http server_
 
 ## Installation
 ```bash
