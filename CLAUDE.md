@@ -6,7 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `gitserve` is a minimal HTTP server exposing local bare Git repositories over the smart HTTP protocol,
 so they can be cloned/pushed with `git clone http://localhost:8085/<repo>` without a public forge.
-The program is a single file, `gitserve.go` (package `main`), tested by `gitserve_test.go`.
+The repositories live in a store: a directory, or a zip archive loaded in memory.
+The program is the package `main`, one file per concern, each tested by its `_test.go` file:
+`gitserve.go` (command line), `server.go` (HTTP), `spool.go` (request and response buffers), `store.go` (stores),
+`archive.go` (zip archives) and `repository.go` (repositories). `e2e_test.go` drives the real `git` client
+against the server.
 
 The goal is decentralized collaboration: bare repositories carried on a USB key or any other medium,
 served with zero setup so that collaborators can clone and push without a forge. Simplicity is the point.
@@ -21,19 +25,21 @@ Conversation with the user happens in French.
 ## Commands
 
 ```bash
-go build -o . .                  # build the ./gitserve binary
-go vet ./...                     # static checks
-go test ./...                    # run all tests
-go test -run TestServe ./...     # run only the tests matching a regexp
-./gitserve gitroot /             # serve ./gitroot at URL prefix / on port 8085 (foreground)
-./start.sh                       # build if needed, then run in background, logging to gitserve.log
-git init --bare gitroot/my-repo  # create a servable repository
+go build -o . .                     # build the ./gitserve binary
+go vet ./...                        # static checks
+go test ./...                       # run all tests; the end-to-end test needs git, and is skipped without it
+go test -run TestServe ./...        # run only the tests matching a regexp
+./gitserve create gitroot my-repo   # create a bare repository in the gitroot directory
+./gitserve serve gitroot            # serve ./gitroot on port 8085 (foreground)
+./gitserve serve -p 9000 repos.zip  # serve a zip archive on port 9000, creating it if needed
+./start.sh                          # build if needed, then run in background, logging to gitserve.log
 ```
 
 Sources follow standard Go formatting: run `gofmt -w .` before committing, the CI rejects unformatted code.
 
-go-git-http runs Git from the hardcoded path `/usr/bin/git`: on this Windows machine, try the server under WSL.
-In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument such as `/` becomes a Windows path.
+The server is pure Go, and runs natively on this Windows machine.
+`go test -race`, as run by the CI, needs a cgo toolchain that this machine lacks: run it under WSL.
+In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument such as `/git` becomes a Windows path.
 
 ## CI
 
@@ -49,15 +55,33 @@ In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument su
 
 ## Architecture
 
-- Git protocol handling is fully delegated to `github.com/AaronO/go-git-http` (`githttp.New(root)`),
-  mounted on an `http.ServeMux` under the URL prefix given on the command line.
-  It looks a repository up as the root joined with the whole URL path (the prefix is not stripped),
-  so the prefix must be a directory under the root.
-- `requestLogger` wraps the mux with a `statusRecorder` that captures the status code, to log each request.
-- `parseArgs` handles `gitserve <path> [<prefix>]`; any other argument count prints the usage and exits with code 2:
-  - with two args, `<path>` is the repositories root and `<prefix>` the URL mount point
-    (normalized to start and end with `/`);
-  - with one arg, the root is the *parent* directory of `<path>`, and the base name of `<path>` is the prefix.
-- The listen address is hardcoded to `:8085`. On SIGINT or SIGTERM, `serve` shuts the server down gracefully:
-  in-flight requests get 5 s, then `server.Close` releases the rest. `serve` returns only once the shutdown is over.
-- `gitroot/` is the default repository root used by `start.sh`; its contents are git-ignored except `.git*` files.
+- Git itself is implemented by go-git v6, a beta pinned in `go.mod`: the v5 line has no usable server side.
+  `gitHandler` (`server.go`) routes the smart HTTP endpoints (`info/refs`, `git-upload-pack`, `git-receive-pack`)
+  found under the URL prefix, which it strips, then runs `transport.UploadPack` or `transport.ReceivePack`
+  on the storage of the repository. The dumb protocol is refused.
+  The handler reads the whole request into a `spool` (`spool.go`: in memory up to 4 MiB, then in a temporary file)
+  before accessing the store, and sends the response from a spool once that access is over:
+  no network transfer ever happens while the store is locked, so a slow client cannot stall the others.
+  go-git's own `backend` package is not used: it answers 401 to anonymous pushes, and 500 for a missing repository.
+- A `store` (`store.go`) holds the repositories as a go-billy filesystem:
+  `osfs` for a directory, `memfs` for a zip archive, which is any path ending with `.zip`.
+  `view` gives shared access, `change` exclusive access; a push runs under `change`.
+  An archive is reloaded when its file changes on disk, as when another gitserve command changes it.
+  `persist` writes it back atomically (temporary file, then rename); a push calls it from the post-receive hook
+  of go-git. When the write fails, `persist` has the next access reload the file, which discards the push,
+  and the handler replaces the response with an error on the error band of the side-band (an HTTP 500 without
+  side-band): the push fails on the client, which displays the reason as a `remote:` message.
+- `archive.go` converts between zip and `memfs`. The `.gitserve` marker at the root of an archive records
+  the format version (`{"version":1}`); an archive without marker is accepted, and gets one on its next write.
+  Files under `objects/` are stored without compression, since Git already compresses them.
+- `repository.go`: a repository is a directory holding `HEAD` and `config` files. A name is a slash-separated path
+  checked by `checkName`; `findRepository` also tries it with a `.git` suffix, for the server and `delete` alike.
+  Repositories are created with `git.Init`, and never nested in another repository.
+- The command line (`gitserve.go`) uses cobra: `serve`, `init`, `create`, `delete` and `list`.
+  `run` returns the exit status: 2 for a usage error, detected as an error raised before the command runs,
+  and 1 when the command fails.
+- `requestLogger` wraps the handler with a `statusRecorder` that captures the status code, to log each request.
+- The server listens on `:<port>`, 8085 by default. On SIGINT or SIGTERM, `serve` shuts the server down gracefully:
+  in-flight requests get 5 s, then `server.Close` releases the rest. `serve` returns only once the shutdown is over,
+  then `runServer` waits for an archive write in progress (`store.close`).
+- `gitroot/` is the default store used by `start.sh`; its contents are git-ignored except `.git*` files.

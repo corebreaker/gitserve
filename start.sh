@@ -1,5 +1,4 @@
 #! /bin/sh
 [ -x ./gitserve ] || go build -o . .
 
-nohup ./gitserve gitroot / >gitserve.log 2>&1 &
-
+nohup ./gitserve serve gitroot >gitserve.log 2>&1 &
