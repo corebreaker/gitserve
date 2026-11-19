@@ -1,6 +1,6 @@
 name: Claude PR Review
 
-# Triggered by a comment on a PR. Two distinct commands:
+# Triggered by a comment on a PR. Two distinct commands, each of which must start the comment:
 #
 #   /claude review              -> review posted as a comment, no approval
 #   /claude review and approve  -> review posted, plus approval if the PR is deemed mergeable
@@ -11,6 +11,12 @@ name: Claude PR Review
 # Only the repository owner may trigger these commands (comparison of
 # `github.event.comment.user.login` with `github.repository_owner`). A comment posted by any
 # other contributor is ignored, even if it contains `/claude review`.
+#
+# claude-code-action tells Claude that it can neither submit reviews nor approve pull requests:
+# Claude only writes its review to `review.json`, which a later step of each job posts. That step
+# lives in this workflow, which GitHub runs from `main`, rather than in a script of the repository:
+# the jobs check out the head of the pull request, whose files must not run with the token that
+# approves.
 
 on:
   issue_comment:
@@ -107,22 +113,15 @@ jobs:
                  since the last review,
                - a summary of the positive aspects,
                - a table of points by severity (new and open).
-            8. Post the review via the GitHub API in a single request that includes both the
-               overall summary AND the inline comments on the exact diff lines. First create the
-               `review.json` file at the repository root with the `Write` tool (never write this
-               file via a Bash redirection `cat >`/`tee`: only `gh` commands are allowed in Bash),
-               then post it:
-
-               ```bash
-               gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}/reviews \
-                 --method POST \
-                 --input review.json
-               ```
+            8. Write the review to the `review.json` file at the repository root with the `Write`
+               tool (never through a Bash redirection such as `cat >` or `tee`: only `gh` commands
+               are allowed in Bash). Do not post it, nor any other review: the next step of the
+               workflow posts it on the reviewed commit, as a single review holding both the
+               overall summary AND the inline comments on the exact diff lines.
 
                Format of `review.json`:
                ```json
                {
-                 "commit_id": "<SHA obtained in step 2>",
                  "body": "<overall review summary in markdown>",
                  "event": "COMMENT",
                  "comments": [
@@ -148,8 +147,29 @@ jobs:
                - If no point deserves an inline comment, `"comments"` may be an empty array.
 
             **Do NOT attempt to approve the PR.** This command is purely informative, whatever
-            your analysis concludes.
+            your analysis concludes: the workflow posts the review as a comment in any case.
           allowed_tools: "Read,Glob,Grep,Write,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue view:*),Bash(gh api:*)"
+
+      # Claude only wrote the review: post it on the commit it reviewed, as a comment whatever
+      # event Claude chose.
+      - name: Post the review
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REVIEWS: repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}/reviews
+        run: |
+          if [ ! -s review.json ]; then
+            echo "::error::Claude wrote no review.json"
+            exit 1
+          fi
+
+          jq --arg sha "$(git rev-parse HEAD)" '.commit_id = $sha | .event = "COMMENT"' review.json > review-post.json
+          if ! gh api "$REVIEWS" --method POST --input review-post.json > /dev/null; then
+            # GitHub refuses an inline comment on a line outside the diff: move them into the body.
+            echo "::warning::GitHub refused the inline comments: they go into the body of the review"
+            jq '.body += "\n\n### Inline comments\n\n" + ([.comments[]? | "- `\(.path):\(.line)`: \(.body)"] | join("\n")) | del(.comments)' \
+              review-post.json > review-flat.json
+            gh api "$REVIEWS" --method POST --input review-flat.json > /dev/null
+          fi
 
   # =============================================================================================
   # Review + conditional approval. Approval is granted only in the absence of any Critical or
@@ -160,7 +180,7 @@ jobs:
     if: >-
       github.event.issue.pull_request != null &&
       github.event.comment.user.login == github.repository_owner &&
-      contains(github.event.comment.body, '/claude review and approve')
+      startsWith(github.event.comment.body, '/claude review and approve')
     runs-on: ubuntu-latest
     # Same serialization rules as the `review` job. Both jobs deliberately share the same
     # `group` so that an approval command cancels an informative review in progress (and vice
@@ -241,22 +261,15 @@ jobs:
                - the table of points by severity (new and open),
                - a final **Decision** section explicitly stating "Approved" or "Changes requested"
                  with the justification.
-            9. Post the review via the GitHub API in a single request that includes both the
-               overall summary AND the inline comments on the exact diff lines. First create the
-               `review.json` file at the repository root with the `Write` tool (never write this
-               file via a Bash redirection `cat >`/`tee`: only `gh` commands are allowed in Bash),
-               then post it:
-
-               ```bash
-               gh api repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}/reviews \
-                 --method POST \
-                 --input review.json
-               ```
+            9. Write the review to the `review.json` file at the repository root with the `Write`
+               tool (never through a Bash redirection such as `cat >` or `tee`: only `gh` commands
+               are allowed in Bash). Do not post it, nor any other review or approval: the next
+               step of the workflow posts it on the reviewed commit, as a single review holding
+               both the overall summary AND the inline comments on the exact diff lines.
 
                Format of `review.json` (adapt `"event"` to the decision):
                ```json
                {
-                 "commit_id": "<SHA obtained in step 2>",
                  "body": "<overall review summary in markdown>",
                  "event": "APPROVE",
                  "comments": [
@@ -288,3 +301,30 @@ jobs:
             Never bypass the criteria: a single Critical or Important point is enough to force
             `"REQUEST_CHANGES"` and forbids `"APPROVE"`.
           allowed_tools: "Read,Glob,Grep,Write,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue view:*),Bash(gh api:*)"
+
+      # Claude only wrote the review: post it on the commit it reviewed, with the event Claude
+      # decided, which may only approve or request changes.
+      - name: Post the review
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REVIEWS: repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}/reviews
+        run: |
+          if [ ! -s review.json ]; then
+            echo "::error::Claude wrote no review.json"
+            exit 1
+          fi
+
+          event=$(jq -r .event review.json)
+          if [ "$event" != APPROVE ] && [ "$event" != REQUEST_CHANGES ]; then
+            echo "::error::review.json has the event \"$event\", instead of APPROVE or REQUEST_CHANGES"
+            exit 1
+          fi
+
+          jq --arg sha "$(git rev-parse HEAD)" '.commit_id = $sha' review.json > review-post.json
+          if ! gh api "$REVIEWS" --method POST --input review-post.json > /dev/null; then
+            # GitHub refuses an inline comment on a line outside the diff: move them into the body.
+            echo "::warning::GitHub refused the inline comments: they go into the body of the review"
+            jq '.body += "\n\n### Inline comments\n\n" + ([.comments[]? | "- `\(.path):\(.line)`: \(.body)"] | join("\n")) | del(.comments)' \
+              review-post.json > review-flat.json
+            gh api "$REVIEWS" --method POST --input review-flat.json > /dev/null
+          fi
