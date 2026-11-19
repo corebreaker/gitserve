@@ -59,6 +59,11 @@ jobs:
           ref: refs/pull/${{ github.event.issue.number }}/head
           fetch-depth: 0
 
+      # The pull request may hold a review.json of its own: remove it, so that the review posted
+      # below can only be the one that Claude writes.
+      - name: Remove any review.json of the pull request
+        run: rm -f review.json
+
       - name: Run Claude review
         uses: anthropics/claude-code-action@beta
         with:
@@ -210,6 +215,11 @@ jobs:
         with:
           ref: refs/pull/${{ github.event.issue.number }}/head
           fetch-depth: 0
+
+      # The pull request may hold a review.json of its own: remove it, so that the review posted
+      # below can only be the one that Claude writes.
+      - name: Remove any review.json of the pull request
+        run: rm -f review.json
 
       - name: Run Claude review with conditional approval
         uses: anthropics/claude-code-action@beta
