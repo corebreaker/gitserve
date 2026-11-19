@@ -11,21 +11,40 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/go-git/go-git/v6/utils/ioutil"
 )
 
 const shutdownTimeout = 5 * time.Second
 
 // gitHandler serves the repositories of a store over the smart HTTP protocol of Git.
+//
+// It reads a whole request before locking the store, and sends the response once the store is unlocked,
+// both through spools: a slow client never keeps the store locked, which would stall the other requests.
 type gitHandler struct {
 	store *store
 	// prefix is the URL path under which the repositories are served. It starts and ends with a slash.
 	prefix string
+}
+
+// gitRequest is a request for a Git service on a repository.
+type gitRequest struct {
+	// name is the name under which the repository is served.
+	name string
+	// service is transport.UploadPackService or transport.ReceivePackService.
+	service string
+	// advertise tells that the client only asks for the references of the repository,
+	// as the first step of a fetch or a push.
+	advertise bool
+	// version is the version of the protocol that the client asks for, from the Git-Protocol header.
+	version string
+	// body is the content of the request. An advertisement has none.
+	body *spool
 }
 
 // ServeHTTP routes a request of the smart HTTP protocol to the service it asks for.
@@ -38,15 +57,16 @@ func (h *gitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	method, service := http.MethodPost, ""
-	name, advertise := strings.CutSuffix(path, "/info/refs")
+	req := gitRequest{version: r.Header.Get("Git-Protocol")}
+	method := http.MethodPost
+	req.name, req.advertise = strings.CutSuffix(path, "/info/refs")
 	switch {
-	case advertise:
-		method, service = http.MethodGet, r.URL.Query().Get("service")
+	case req.advertise:
+		method, req.service = http.MethodGet, r.URL.Query().Get("service")
 	case strings.HasSuffix(path, "/"+transport.UploadPackService):
-		name, service = strings.TrimSuffix(path, "/"+transport.UploadPackService), transport.UploadPackService
+		req.name, req.service = strings.TrimSuffix(path, "/"+transport.UploadPackService), transport.UploadPackService
 	case strings.HasSuffix(path, "/"+transport.ReceivePackService):
-		name, service = strings.TrimSuffix(path, "/"+transport.ReceivePackService), transport.ReceivePackService
+		req.name, req.service = strings.TrimSuffix(path, "/"+transport.ReceivePackService), transport.ReceivePackService
 	default:
 		http.NotFound(w, r)
 		return
@@ -58,92 +78,110 @@ func (h *gitHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if service != transport.UploadPackService && service != transport.ReceivePackService {
+	if req.service != transport.UploadPackService && req.service != transport.ReceivePackService {
 		// Only very old clients, that predate the smart protocol, ask for references without naming a service.
 		http.Error(w, "only the smart HTTP protocol of Git is supported", http.StatusForbidden)
 		return
 	}
 
-	run := func(fsys billy.Filesystem) error {
-		h.run(w, r, fsys, name, service, advertise)
-		return nil
+	if !req.advertise {
+		body, err := readBody(r)
+		if err != nil {
+			log.Printf("Reading a request for %s %s: %v", req.service, req.name, err)
+			http.Error(w, "cannot read the request", http.StatusBadRequest)
+			return
+		}
+		defer body.remove()
+
+		req.body = body
 	}
+
+	response := &spool{}
+	defer response.remove()
 
 	// Pushing changes the repository, everything else only reads it.
 	access := h.store.view
-	if service == transport.ReceivePackService && !advertise {
+	if req.service == transport.ReceivePackService && !req.advertise {
 		access = h.store.change
 	}
 
-	if err := access(run); err != nil {
-		log.Printf("Store %s: %v", h.store.path, err)
-		http.Error(w, "store unavailable", http.StatusInternalServerError)
-	}
-}
+	err := access(func(fsys billy.Filesystem) error {
+		return h.run(r.Context(), fsys, req, response)
+	})
 
-// run runs a service on the repository served under name: it reads the client request from the HTTP request,
-// if any, and streams the result as the HTTP response. With advertise, the service only advertises the references
-// of the repository, as the first step of a fetch or a push.
-func (h *gitHandler) run(w http.ResponseWriter, r *http.Request, fsys billy.Filesystem, name, service string,
-	advertise bool,
-) {
-	storage, err := openRepository(fsys, name)
-	if errors.Is(err, transport.ErrRepositoryNotFound) || errors.Is(err, errInvalidName) {
+	switch {
+	case errors.Is(err, transport.ErrRepositoryNotFound) || errors.Is(err, errInvalidName):
 		http.Error(w, "repository not found", http.StatusNotFound)
 		return
-	} else if err != nil {
-		log.Printf("Opening repository %s: %v", name, err)
-		http.Error(w, "cannot open the repository", http.StatusInternalServerError)
-		return
+	case err != nil:
+		log.Printf("%s %s: %v", req.service, req.name, err)
+		if response.size == 0 {
+			// Nothing to send yet: the failure can still show as an HTTP status.
+			http.Error(w, "the request failed", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	send(w, req, response)
+}
+
+// readBody reads the whole body of the request into a spool, decompressing it when it is gzipped.
+func readBody(r *http.Request) (*spool, error) {
+	body := io.Reader(r.Body)
+	if r.Header.Get("Content-Encoding") == "gzip" {
+		gzipReader, err := gzip.NewReader(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		defer gzipReader.Close()
+
+		body = gzipReader
+	}
+
+	content := &spool{}
+	if _, err := io.Copy(content, body); err != nil {
+		content.remove()
+		return nil, err
+	}
+
+	return content, nil
+}
+
+// run runs the service that req asks for, on the repository of fsys that it names, and writes the result
+// to response.
+func (h *gitHandler) run(ctx context.Context, fsys billy.Filesystem, req gitRequest, response *spool) error {
+	storage, err := openRepository(fsys, req.name)
+	if err != nil {
+		return err
 	}
 	defer storage.Close()
 
-	var request io.ReadCloser
-	result := "advertisement"
-	if !advertise {
-		result = "result"
-		body := io.Reader(r.Body)
-		if r.Header.Get("Content-Encoding") == "gzip" {
-			gzipReader, err := gzip.NewReader(r.Body)
-			if err != nil {
-				http.Error(w, "invalid gzip request body", http.StatusBadRequest)
-				return
-			}
-			defer gzipReader.Close()
-
-			body = gzipReader
+	var body io.ReadCloser
+	if req.body != nil {
+		content, err := req.body.reader()
+		if err != nil {
+			return err
 		}
 
-		// The service closes the request once read, but the HTTP server owns the body.
-		request = io.NopCloser(body)
+		// The service closes what it reads and what it writes, but the handler owns both spools.
+		body = io.NopCloser(content)
 	}
 
-	w.Header().Set("Content-Type", "application/x-"+service+"-"+result)
-	w.Header().Set("Cache-Control", "no-cache")
-
-	response := &responseStream{w: w, controller: http.NewResponseController(w)}
-	version := r.Header.Get("Git-Protocol")
-	if service == transport.UploadPackService {
-		err = transport.UploadPack(r.Context(), storage, request, response, &transport.UploadPackRequest{
-			GitProtocol:   version,
-			AdvertiseRefs: advertise,
+	result := ioutil.WriteNopCloser(response)
+	if req.service == transport.UploadPackService {
+		return transport.UploadPack(ctx, storage, body, result, &transport.UploadPackRequest{
+			GitProtocol:   req.version,
+			AdvertiseRefs: req.advertise,
 			StatelessRPC:  true,
 		})
-	} else {
-		err = transport.ReceivePack(r.Context(), storage, request, response, &transport.ReceivePackRequest{
-			GitProtocol:   version,
-			AdvertiseRefs: advertise,
-			StatelessRPC:  true,
-			Hooks:         transport.ReceivePackHooks{PostReceive: h.persist},
-		})
 	}
 
-	if err != nil {
-		log.Printf("%s %s: %v", service, name, err)
-		if !response.started.Load() {
-			http.Error(w, "service failed", http.StatusInternalServerError)
-		}
-	}
+	return transport.ReceivePack(ctx, storage, body, result, &transport.ReceivePackRequest{
+		GitProtocol:   req.version,
+		AdvertiseRefs: req.advertise,
+		StatelessRPC:  true,
+		Hooks:         transport.ReceivePackHooks{PostReceive: h.persist},
+	})
 }
 
 // persist runs once a push has updated references: it writes an archive back to its file.
@@ -164,31 +202,26 @@ func (h *gitHandler) persist(_ context.Context, info *transport.PostReceiveInfo)
 	return nil
 }
 
-// responseStream writes the result of a service to an HTTP response.
-// It flushes each write, so that the client displays progress messages without delay.
-type responseStream struct {
-	w          http.ResponseWriter
-	controller *http.ResponseController
-	// started records whether the response started, after which an error can no longer change its status.
-	// It is atomic, because the services write from goroutines of their own.
-	started atomic.Bool
-}
-
-// Write writes p to the response, and flushes it.
-func (s *responseStream) Write(p []byte) (int, error) {
-	s.started.Store(true)
-
-	n, err := s.w.Write(p)
-	if err == nil {
-		err = s.controller.Flush()
+// send sends the response that a service wrote to a spool, in large chunks of known total length.
+func send(w http.ResponseWriter, req gitRequest, response *spool) {
+	content, err := response.reader()
+	if err != nil {
+		log.Printf("Reading the response of %s %s: %v", req.service, req.name, err)
+		http.Error(w, "the request failed", http.StatusInternalServerError)
+		return
 	}
 
-	return n, err
-}
+	kind := "result"
+	if req.advertise {
+		kind = "advertisement"
+	}
 
-// Close does nothing: the HTTP server ends the response once the handler returns.
-func (s *responseStream) Close() error {
-	return nil
+	w.Header().Set("Content-Type", "application/x-"+req.service+"-"+kind)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Content-Length", strconv.FormatInt(response.size, 10))
+	if _, err := io.Copy(w, content); err != nil {
+		log.Printf("Sending the response of %s %s: %v", req.service, req.name, err)
+	}
 }
 
 // statusRecorder wraps an http.ResponseWriter to remember the status code sent to the client.
@@ -203,7 +236,8 @@ func (rec *statusRecorder) WriteHeader(code int) {
 	rec.ResponseWriter.WriteHeader(code)
 }
 
-// Unwrap returns the wrapped http.ResponseWriter, so that http.ResponseController can flush it.
+// Unwrap returns the wrapped http.ResponseWriter, so that http.ResponseController reaches its features,
+// such as flushing.
 func (rec *statusRecorder) Unwrap() http.ResponseWriter {
 	return rec.ResponseWriter
 }

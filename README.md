@@ -52,6 +52,10 @@ Since the whole archive is held in memory and rewritten at each push, it suits s
 An archive must be served by a single server at a time,
 but the other commands can change it while it is served: the server reloads it.
 
+Whatever the store, the server reads each request whole before accessing the store,
+and sends its response once that access is over, so that a slow client never holds back the others.
+Requests and responses up to 4 MiB are kept in memory, larger ones in temporary files.
+
 
 ## Commands
 

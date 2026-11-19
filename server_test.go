@@ -10,10 +10,13 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
 	"github.com/go-git/go-git/v6/plumbing/transport"
@@ -89,6 +92,122 @@ func TestGitHandlerAdvertisesReferences(t *testing.T) {
 
 	if rec.Header().Get("Cache-Control") != "no-cache" {
 		t.Errorf("advertisement cache control %q, want no-cache", rec.Header().Get("Cache-Control"))
+	}
+
+	// The response is sent whole, with its length.
+	if length := rec.Header().Get("Content-Length"); length != strconv.Itoa(rec.Body.Len()) {
+		t.Errorf("advertisement content length %q, want %d", length, rec.Body.Len())
+	}
+}
+
+// blockingReader is the body of a request from a slow client: it blocks until released, then ends.
+type blockingReader struct {
+	reading chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingReader() *blockingReader {
+	return &blockingReader{reading: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (r *blockingReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.reading) })
+	<-r.release
+
+	return 0, io.EOF
+}
+
+// blockingWriter is the response to a slow client: its writes block until released.
+type blockingWriter struct {
+	*httptest.ResponseRecorder
+	writing chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingWriter() *blockingWriter {
+	return &blockingWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		writing:          make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.writing) })
+	<-w.release
+
+	return w.ResponseRecorder.Write(p)
+}
+
+// assertStoreAvailable checks that the store can be changed, which needs every other access to be over.
+func assertStoreAvailable(t *testing.T, st *store) {
+	t.Helper()
+
+	changed := make(chan error, 1)
+	go func() { changed <- st.change(func(billy.Filesystem) error { return nil }) }()
+
+	select {
+	case err := <-changed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the store stays locked while a slow client transfers data")
+	}
+}
+
+func TestGitHandlerDoesNotLockStoreWhileReceiving(t *testing.T) {
+	st := newMemoryStore()
+	if err := createRepository(st.fs, "demo", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	// A push from a slow client is still sending its request.
+	body := newBlockingReader()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+
+		req := httptest.NewRequest(http.MethodPost, "/demo/git-receive-pack", body)
+		(&gitHandler{store: st, prefix: "/"}).ServeHTTP(httptest.NewRecorder(), req)
+	}()
+
+	<-body.reading
+	assertStoreAvailable(t, st)
+
+	close(body.release)
+	<-served
+}
+
+func TestGitHandlerDoesNotLockStoreWhileSending(t *testing.T) {
+	st := newMemoryStore()
+	if err := createRepository(st.fs, "demo", "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	// A slow client is still receiving the references of the repository.
+	w := newBlockingWriter()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+
+		req := httptest.NewRequest(http.MethodGet, "/demo/info/refs?service=git-upload-pack", nil)
+		(&gitHandler{store: st, prefix: "/"}).ServeHTTP(w, req)
+	}()
+
+	<-w.writing
+	assertStoreAvailable(t, st)
+
+	close(w.release)
+	<-served
+
+	if w.Code != http.StatusOK || w.Body.Len() == 0 {
+		t.Errorf("advertisement to the slow client: status %d, %d bytes", w.Code, w.Body.Len())
 	}
 }
 

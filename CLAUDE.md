@@ -8,8 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 so they can be cloned/pushed with `git clone http://localhost:8085/<repo>` without a public forge.
 The repositories live in a store: a directory, or a zip archive loaded in memory.
 The program is the package `main`, one file per concern, each tested by its `_test.go` file:
-`gitserve.go` (command line), `server.go` (HTTP), `store.go` (stores), `archive.go` (zip archives)
-and `repository.go` (repositories). `e2e_test.go` drives the real `git` client against the server.
+`gitserve.go` (command line), `server.go` (HTTP), `spool.go` (request and response buffers), `store.go` (stores),
+`archive.go` (zip archives) and `repository.go` (repositories). `e2e_test.go` drives the real `git` client
+against the server.
 
 The goal is decentralized collaboration: bare repositories carried on a USB key or any other medium,
 served with zero setup so that collaborators can clone and push without a forge. Simplicity is the point.
@@ -58,6 +59,9 @@ In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument su
   `gitHandler` (`server.go`) routes the smart HTTP endpoints (`info/refs`, `git-upload-pack`, `git-receive-pack`)
   found under the URL prefix, which it strips, then runs `transport.UploadPack` or `transport.ReceivePack`
   on the storage of the repository. The dumb protocol is refused.
+  The handler reads the whole request into a `spool` (`spool.go`: in memory up to 4 MiB, then in a temporary file)
+  before accessing the store, and sends the response from a spool once that access is over:
+  no network transfer ever happens while the store is locked, so a slow client cannot stall the others.
   go-git's own `backend` package is not used: it answers 401 to anonymous pushes, and 500 for a missing repository.
 - A `store` (`store.go`) holds the repositories as a go-billy filesystem:
   `osfs` for a directory, `memfs` for a zip archive, which is any path ending with `.zip`.
@@ -75,7 +79,7 @@ In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument su
   `run` returns the exit status: 2 for a usage error, detected as an error raised before the command runs,
   and 1 when the command fails.
 - `requestLogger` wraps the handler with a `statusRecorder` that captures the status code, to log each request;
-  `statusRecorder.Unwrap` lets the services flush the response through it.
+  `statusRecorder.Unwrap` lets `http.ResponseController` reach the wrapped writer.
 - The server listens on `:<port>`, 8085 by default. On SIGINT or SIGTERM, `serve` shuts the server down gracefully:
   in-flight requests get 5 s, then `server.Close` releases the rest. `serve` returns only once the shutdown is over,
   then `runServer` waits for an archive write in progress (`store.close`).
