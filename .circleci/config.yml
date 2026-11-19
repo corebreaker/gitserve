@@ -1,0 +1,70 @@
+version: 2.1
+
+# The gitserve gate, split across jobs so a failure names the offending check.
+
+executors:
+  go:
+    docker:
+      - image: cimg/go:1.27
+        auth:
+          username: corebreaker
+          password: $DOCKERHUB_ACCESS_TOKEN
+
+commands:
+  go-deps:
+    description: "Restore, download and cache the Go module dependencies"
+    steps:
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}
+      - run:
+          name: Download dependencies
+          command: "go mod download"
+      - save_cache:
+          key: go-mod-v1-{{ checksum "go.sum" }}
+          paths:
+            - "/home/circleci/go/pkg/mod"
+
+jobs:
+  lint:
+    executor: go
+    steps:
+      - checkout
+      - go-deps
+      - run:
+          name: Show toolchain version
+          command: "go version"
+      - run:
+          name: Check formatting
+          command: 'test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }'
+      - run:
+          name: Check that go.mod and go.sum are tidy
+          command: "go mod tidy -diff"
+      - run:
+          name: Go vet
+          command: "go vet ./..."
+
+  build:
+    executor: go
+    steps:
+      - checkout
+      - go-deps
+      - run:
+          name: Build
+          command: "go build -o gitserve ."
+
+  test:
+    executor: go
+    steps:
+      - checkout
+      - go-deps
+      - run:
+          name: Run tests
+          command: "go test -race ./..."
+
+workflows:
+  all-checks:
+    jobs:
+      - lint
+      - build
+      - test
