@@ -77,7 +77,8 @@ jobs:
 
             1. Fetch the full diff via `gh pr diff ${{ github.event.issue.number }}` and the
                description via `gh pr view ${{ github.event.issue.number }}`.
-            2. Fetch the HEAD commit SHA:
+            2. Fetch the HEAD commit SHA, to name the reviewed commit in the review, which the
+               workflow pins to that commit:
                `gh pr view ${{ github.event.issue.number }} --json headRefOid --jq .headRefOid`
             3. Fetch the history of previous reviews and exchanges:
                - Past reviews:
@@ -148,7 +149,8 @@ jobs:
 
             **Do NOT attempt to approve the PR.** This command is purely informative, whatever
             your analysis concludes: the workflow posts the review as a comment in any case.
-          allowed_tools: "Read,Glob,Grep,Write,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue view:*),Bash(gh api:*)"
+          allowed_tools: >-
+            Read,Glob,Grep,Write,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue view:*),Bash(gh api:*)
 
       # Claude only wrote the review: post it on the commit it reviewed, as a comment whatever
       # event Claude chose.
@@ -164,10 +166,17 @@ jobs:
 
           jq --arg sha "$(git rev-parse HEAD)" '.commit_id = $sha | .event = "COMMENT"' review.json > review-post.json
           if ! gh api "$REVIEWS" --method POST --input review-post.json > /dev/null; then
-            # GitHub refuses an inline comment on a line outside the diff: move them into the body.
-            echo "::warning::GitHub refused the inline comments: they go into the body of the review"
-            jq '.body += "\n\n### Inline comments\n\n" + ([.comments[]? | "- `\(.path):\(.line)`: \(.body)"] | join("\n")) | del(.comments)' \
-              review-post.json > review-flat.json
+            # GitHub refuses an inline comment on a line outside the diff: retry with the inline
+            # comments in the body. Without inline comments, the failure has another cause.
+            if ! jq -e '.comments | length > 0' review-post.json > /dev/null; then
+              exit 1
+            fi
+
+            echo "::warning::Posting the review failed: retrying with its inline comments in its body"
+            flatten='.body += "\n\n### Inline comments\n\n"
+              + ([.comments[] | "- \(.path), line \(.line): \(.body)"] | join("\n"))
+              | del(.comments)'
+            jq "$flatten" review-post.json > review-flat.json
             gh api "$REVIEWS" --method POST --input review-flat.json > /dev/null
           fi
 
@@ -220,7 +229,8 @@ jobs:
 
             1. Fetch the full diff via `gh pr diff ${{ github.event.issue.number }}` and the
                description via `gh pr view ${{ github.event.issue.number }}`.
-            2. Fetch the HEAD commit SHA:
+            2. Fetch the HEAD commit SHA, to name the reviewed commit in the review, which the
+               workflow pins to that commit:
                `gh pr view ${{ github.event.issue.number }} --json headRefOid --jq .headRefOid`
             3. Fetch the history of previous reviews and exchanges:
                - Past reviews:
@@ -300,7 +310,8 @@ jobs:
 
             Never bypass the criteria: a single Critical or Important point is enough to force
             `"REQUEST_CHANGES"` and forbids `"APPROVE"`.
-          allowed_tools: "Read,Glob,Grep,Write,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue view:*),Bash(gh api:*)"
+          allowed_tools: >-
+            Read,Glob,Grep,Write,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh issue view:*),Bash(gh api:*)
 
       # Claude only wrote the review: post it on the commit it reviewed, with the event Claude
       # decided, which may only approve or request changes.
@@ -322,9 +333,16 @@ jobs:
 
           jq --arg sha "$(git rev-parse HEAD)" '.commit_id = $sha' review.json > review-post.json
           if ! gh api "$REVIEWS" --method POST --input review-post.json > /dev/null; then
-            # GitHub refuses an inline comment on a line outside the diff: move them into the body.
-            echo "::warning::GitHub refused the inline comments: they go into the body of the review"
-            jq '.body += "\n\n### Inline comments\n\n" + ([.comments[]? | "- `\(.path):\(.line)`: \(.body)"] | join("\n")) | del(.comments)' \
-              review-post.json > review-flat.json
+            # GitHub refuses an inline comment on a line outside the diff: retry with the inline
+            # comments in the body. Without inline comments, the failure has another cause.
+            if ! jq -e '.comments | length > 0' review-post.json > /dev/null; then
+              exit 1
+            fi
+
+            echo "::warning::Posting the review failed: retrying with its inline comments in its body"
+            flatten='.body += "\n\n### Inline comments\n\n"
+              + ([.comments[] | "- \(.path), line \(.line): \(.body)"] | join("\n"))
+              | del(.comments)'
+            jq "$flatten" review-post.json > review-flat.json
             gh api "$REVIEWS" --method POST --input review-flat.json > /dev/null
           fi
