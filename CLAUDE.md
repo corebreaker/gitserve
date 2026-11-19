@@ -36,10 +36,17 @@ go test -run TestServe ./...        # run only the tests matching a regexp
 ```
 
 Sources follow standard Go formatting: run `gofmt -w .` before committing, the CI rejects unformatted code.
+Lines stay within 120 columns, code included, a tab counting as 4.
 
 The server is pure Go, and runs natively on this Windows machine.
-`go test -race`, as run by the CI, needs a cgo toolchain that this machine lacks: run it under WSL.
 In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument such as `/git` becomes a Windows path.
+`go test -race` needs cgo, which fails with the MSYS2 gcc of this machine: run the test job in the image of the CI,
+which also runs the tests skipped on Windows (`~/project` already exists in the image, hence the copy to `~/work`):
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -e CI=true -v "$(pwd -W):/src:ro" cimg/go:1.27 \
+  bash -c 'cp -r /src ~/work && cd ~/work && go test -race ./...'
+```
 
 ## CI
 
@@ -48,10 +55,25 @@ In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument su
 - Branch protection on `main` requires the `all-checks` check from the `circleci-checks` app (id 18001),
   named after the CircleCI workflow. Renaming that workflow blocks every merge
   until the required check is updated in the protection of `main`.
+  It also requires, even from administrators, an up-to-date branch, an approval given after the last push,
+  and resolved review threads.
+- CircleCI logs need a CircleCI token, and `gh pr checks` only gives the outcome:
+  reproduce a failing job in the image of the CI (see Commands).
 - `.github/workflows/claude-review.yml` runs a Claude review when the repository owner comments on a PR:
   `/claude review` posts a review only, `/claude review and approve` also approves when no Critical
   or Important point is found. It needs the `BOT_APP_ID`, `BOT_APP_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` secrets.
   GitHub runs it from `main` only: changes to the workflow take effect once merged.
+
+## Pull requests
+
+- A change goes through an issue, a branch linked to it, and a PR that closes the issue:
+  `gh issue develop <n> --base main --name <branch> --checkout` creates and checks out the linked branch.
+- The approval of the review bot satisfies the protection of `main`, but any push dismisses it:
+  comment `/claude review and approve` again after the last push, before merging.
+- Answer each inline review comment in its thread with `Fixed in <sha>`, which the next review counts as resolved:
+  `gh api -X POST repos/corebreaker/gitserve/pulls/<pr>/comments/<id>/replies -F body=@<file>`.
+- Merge with `gh pr merge <pr> --merge`, a merge commit as for the previous PRs,
+  then delete the branch, which GitHub keeps after a merge.
 
 ## Architecture
 
@@ -63,6 +85,10 @@ In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument su
   before accessing the store, and sends the response from a spool once that access is over:
   no network transfer ever happens while the store is locked, so a slow client cannot stall the others.
   go-git's own `backend` package is not used: it answers 401 to anonymous pushes, and 500 for a missing repository.
+- go-git advertises references in the order the filesystem lists them, which differs between systems:
+  tests sort them (`git ls-remote --sort=refname`).
+  `TestHasSideBand` and the end-to-end tests check the behaviors of go-git that the handler relies on,
+  in case an upgrade changes them.
 - A `store` (`store.go`) holds the repositories as a go-billy filesystem:
   `osfs` for a directory, `memfs` for a zip archive, which is any path ending with `.zip`.
   `view` gives shared access, `change` exclusive access; a push runs under `change`.
