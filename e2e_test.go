@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -199,6 +200,76 @@ func TestGitClientEndToEnd(t *testing.T) {
 				t.Errorf("main in the reopened store: %s, want %s", main, head)
 			}
 		})
+	}
+}
+
+// TestGitClientPushFailsWhenArchiveCannotBeSaved checks that a push that cannot be saved fails on the client,
+// and is discarded by the server rather than served.
+func TestGitClientPushFailsWhenArchiveCannotBeSaved(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("a read-only directory still accepts new files on Windows")
+	}
+
+	if os.Geteuid() == 0 {
+		t.Skip("permissions do not restrict root")
+	}
+
+	g := newGitClient(t)
+
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	dir := filepath.Join(t.TempDir(), "usb")
+	path := filepath.Join(dir, "repos.zip")
+	if err := initStore(path); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := st.createRepositories([]string{"demo"}, "main"); err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(&gitHandler{store: st, prefix: "/"})
+	defer server.Close()
+
+	url := server.URL + "/demo"
+	work := t.TempDir()
+	clone := filepath.Join(work, "clone")
+	g.run(work, "clone", "-q", url, clone)
+	g.commit(clone, "file.txt", 1)
+	g.run(clone, "push", "-q", "origin", "main")
+	saved := g.run(clone, "rev-parse", "HEAD")
+
+	// The archive can no longer be written, as on a write-protected USB key: the push fails, with the reason.
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	g.commit(clone, "file.txt", 1)
+	out, err := g.try(clone, "push", "origin", "main")
+	if err == nil || !strings.Contains(out, "the push could not be saved to repos.zip, and was discarded") {
+		t.Fatalf("push to an archive that cannot be written: error %v, output:\n%s", err, out)
+	}
+
+	// The server discarded the push, rather than serve commits that the archive lacks.
+	if refs := g.run(work, "ls-remote", url, "refs/heads/main"); refs != saved+"\trefs/heads/main" {
+		t.Fatalf("main after the failed push: %q, want %s", refs, saved)
+	}
+
+	// Once the archive can be written again, the same push goes through.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	g.run(clone, "push", "-q", "origin", "main")
+	if head, main := g.run(clone, "rev-parse", "HEAD"), readBranch(t, path, "demo", "main"); main != head {
+		t.Errorf("main in the archive after the second push: %s, want %s", main, head)
 	}
 }
 

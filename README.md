@@ -45,6 +45,7 @@ and repositories created with `git init --bare` are served as well.
 
 A zip archive acts as the image of a filesystem: the server loads it in memory, and writes it back after each push.
 The new archive replaces the previous one only once fully written, so that an interrupted write never corrupts it.
+When the archive cannot be written, for instance on a write-protected key, the push fails and the server forgets it.
 The archive holds the repositories at its root, next to a `.gitserve` file that records the version of its format;
 a zip made from a directory store is a valid archive too.
 

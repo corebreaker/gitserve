@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-git/v6/plumbing/format/pktline"
+	"github.com/go-git/go-git/v6/plumbing/protocol/packp/sideband"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 )
@@ -176,30 +178,53 @@ func (h *gitHandler) run(ctx context.Context, fsys billy.Filesystem, req gitRequ
 		})
 	}
 
-	return transport.ReceivePack(ctx, storage, body, result, &transport.ReceivePackRequest{
+	var saveErr error
+	multiplexed := false
+	err = transport.ReceivePack(ctx, storage, body, result, &transport.ReceivePackRequest{
 		GitProtocol:   req.version,
 		AdvertiseRefs: req.advertise,
 		StatelessRPC:  true,
-		Hooks:         transport.ReceivePackHooks{PostReceive: h.persist},
+		Hooks: transport.ReceivePackHooks{
+			// Once the push has updated references, write an archive back to its file.
+			PostReceive: func(_ context.Context, info *transport.PostReceiveInfo) error {
+				if len(info.Commands) == 0 {
+					return nil
+				}
+
+				// go-git gives io.Discard for progress when the response has no side-band channel.
+				multiplexed = info.Progress != io.Discard
+				saveErr = h.store.persist()
+
+				return saveErr
+			},
+		},
 	})
+
+	if saveErr != nil {
+		return reportNotSaved(response, filepath.Base(h.store.path), saveErr, multiplexed)
+	}
+
+	return err
 }
 
-// persist runs once a push has updated references: it writes an archive back to its file.
-// A failure is reported to the pushing client, which displays it as a "remote:" message.
-func (h *gitHandler) persist(_ context.Context, info *transport.PostReceiveInfo) error {
-	if len(info.Commands) == 0 {
-		return nil
+// reportNotSaved replaces the response to a push whose archive could not be saved with an error,
+// that makes the push fail on the client: the store discarded the push, which the client must not take for done.
+// With a side-band channel, the error goes on its error band, which the client displays as a "remote:" message;
+// without one, the response is left empty, for the handler to answer with an HTTP error.
+func reportNotSaved(response *spool, archive string, saveErr error, multiplexed bool) error {
+	err := fmt.Errorf("the push could not be saved to %s, and was discarded: %w", archive, saveErr)
+	if resetErr := response.reset(); resetErr != nil || !multiplexed {
+		return errors.Join(err, resetErr)
 	}
 
-	if err := h.store.persist(); err != nil {
-		log.Printf("Saving %s: %v", h.store.path, err)
-		fmt.Fprintf(info.Progress, "gitserve: the push could not be saved to %s: %v\n",
-			filepath.Base(h.store.path), err)
-
-		return err
+	// Packets of the side-band suit clients of the side-band-64k as well. The client ends the message with a newline.
+	message := []byte("gitserve: " + err.Error())
+	_, writeErr := sideband.NewMuxer(sideband.Sideband, response).WriteChannel(sideband.ErrorMessage, message)
+	if writeErr == nil {
+		writeErr = pktline.WriteFlush(response)
 	}
 
-	return nil
+	return errors.Join(err, writeErr)
 }
 
 // send sends the response that a service wrote to a spool, in large chunks of known total length.

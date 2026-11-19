@@ -24,6 +24,7 @@ type store struct {
 	// fs is the root of the repositories: the directory itself, or the in-memory image of the archive.
 	fs billy.Filesystem
 	// stamp identifies the state of the archive file that fs reflects. It is unused for a directory.
+	// The zero stamp matches no archive, whose file is never empty: it makes the next access reload the file.
 	stamp fileStamp
 }
 
@@ -186,6 +187,9 @@ func (s *store) change(fn func(fsys billy.Filesystem) error) error {
 
 // persist writes the in-memory image of an archive back to its file, and does nothing for a directory.
 // It may only be called by a function that change runs.
+//
+// When the write fails, the image holds changes that the file lacks, and that may never reach it:
+// persist then has the next access reload the file, so that these changes are discarded rather than served.
 func (s *store) persist() error {
 	if !s.archive {
 		return nil
@@ -193,6 +197,7 @@ func (s *store) persist() error {
 
 	stamp, err := writeArchive(s.path, s.fs)
 	if err != nil {
+		s.stamp = fileStamp{}
 		return err
 	}
 

@@ -68,7 +68,9 @@ In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument su
   `view` gives shared access, `change` exclusive access; a push runs under `change`.
   An archive is reloaded when its file changes on disk, as when another gitserve command changes it.
   `persist` writes it back atomically (temporary file, then rename); a push calls it from the post-receive hook
-  of go-git, which reports a failure to the client as a `remote:` message.
+  of go-git. When the write fails, `persist` has the next access reload the file, which discards the push,
+  and the handler replaces the response with an error on the error band of the side-band (an HTTP 500 without
+  side-band): the push fails on the client, which displays the reason as a `remote:` message.
 - `archive.go` converts between zip and `memfs`. The `.gitserve` marker at the root of an archive records
   the format version (`{"version":1}`); an archive without marker is accepted, and gets one on its next write.
   Files under `objects/` are stored without compression, since Git already compresses them.

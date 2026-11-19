@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/memfs"
 )
 
@@ -214,6 +215,62 @@ func TestStoreReloadsArchiveChangedOnDisk(t *testing.T) {
 
 	if names := listStore(t, server.path); !slices.Equal(names, []string{"first", "second", "third"}) {
 		t.Errorf("repositories in the archive: %q, want [first second third]", names)
+	}
+}
+
+func TestStoreDiscardsUnsavedChanges(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "usb")
+	path := filepath.Join(dir, "repos.zip")
+	if err := initStore(path); err != nil {
+		t.Fatal(err)
+	}
+
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The archive cannot be written anymore, as when its USB key is removed.
+	err = st.change(func(fsys billy.Filesystem) error {
+		if err := createRepository(fsys, "demo", "main"); err != nil {
+			return err
+		}
+
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+
+		return st.persist()
+	})
+	if err == nil {
+		t.Fatal("persist without the directory of the archive: no error")
+	}
+
+	// The key is back, with the archive as it was: the change that could not be saved is not served.
+	if err := os.MkdirAll(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(path, saved, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	if names, err := st.repositories(); err != nil || len(names) != 0 {
+		t.Errorf("repositories after a failed save = (%q, %v), want none", names, err)
 	}
 }
 

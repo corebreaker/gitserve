@@ -2,14 +2,14 @@ package main
 
 import (
 	"bytes"
-	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,9 +17,6 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v6"
-	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/protocol/packp"
-	"github.com/go-git/go-git/v6/plumbing/transport"
 )
 
 func TestGitHandlerRoutesRequests(t *testing.T) {
@@ -228,43 +225,36 @@ func TestGitHandlerRejectsInvalidGzipBody(t *testing.T) {
 	}
 }
 
-func TestGitHandlerReportsSaveFailure(t *testing.T) {
-	log.SetOutput(io.Discard)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+func TestReportNotSaved(t *testing.T) {
+	saveErr := errors.New("disk full")
+	message := "gitserve: the push could not be saved to repos.zip, and was discarded: disk full"
 
-	// The archive cannot be saved anymore once its directory is gone, as when a USB key is removed.
-	dir := filepath.Join(t.TempDir(), "usb")
-	path := filepath.Join(dir, "repos.zip")
-	if err := initStore(path); err != nil {
+	// With a side-band channel, the report of the push gives way to a packet on the error band, and a flush-pkt.
+	response := &spool{}
+	defer response.remove()
+
+	fmt.Fprint(response, "report of a successful push")
+	if err := reportNotSaved(response, "repos.zip", saveErr, true); !errors.Is(err, saveErr) {
+		t.Errorf("reportNotSaved with side-band: error %v, want the save error", err)
+	}
+
+	want := fmt.Sprintf("%04x\x03%s0000", 4+1+len(message), message)
+	if got := string(readSpool(t, response)); got != want {
+		t.Errorf("response with side-band: %q, want %q", got, want)
+	}
+
+	// Without one, the response is left empty, for the handler to answer with an HTTP error.
+	if err := response.reset(); err != nil {
 		t.Fatal(err)
 	}
 
-	st, err := openStore(path)
-	if err != nil {
-		t.Fatal(err)
+	fmt.Fprint(response, "report of a successful push")
+	if err := reportNotSaved(response, "repos.zip", saveErr, false); !errors.Is(err, saveErr) {
+		t.Errorf("reportNotSaved without side-band: error %v, want the save error", err)
 	}
 
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
-
-	var progress bytes.Buffer
-	handler := &gitHandler{store: st, prefix: "/"}
-	update := &packp.Command{Name: plumbing.NewBranchReferenceName("main")}
-	err = handler.persist(context.Background(), &transport.PostReceiveInfo{
-		Commands: []*packp.Command{update},
-		Progress: &progress,
-	})
-
-	if err == nil || !strings.Contains(progress.String(), "the push could not be saved to repos.zip") {
-		t.Errorf("persist: error %v, message to the client %q; want an error reported to the client",
-			err, progress.String())
-	}
-
-	// A push that updated no reference has nothing to save.
-	progress.Reset()
-	if err := handler.persist(context.Background(), &transport.PostReceiveInfo{Progress: &progress}); err != nil {
-		t.Errorf("persist without update: %v", err)
+	if response.size != 0 {
+		t.Errorf("response without side-band: %d bytes left, want none", response.size)
 	}
 }
 
