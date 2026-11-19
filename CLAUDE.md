@@ -39,13 +39,21 @@ Sources follow standard Go formatting: run `gofmt -w .` before committing, the C
 Lines stay within 120 columns, code included, a tab counting as 4.
 
 The server is pure Go, and runs natively on this Windows machine.
-In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument such as `/git` becomes a Windows path.
+In Git Bash, which also runs the commands that the user types with `!`, prefix commands with `MSYS_NO_PATHCONV=1`,
+otherwise an argument such as `/git` becomes a Windows path. Keep the commands given to the user short:
+a long one may break into several lines when pasted.
 `go test -race` needs cgo, which fails with the MSYS2 gcc of this machine: run the test job in the image of the CI,
 which also runs the tests skipped on Windows (`~/project` already exists in the image, hence the copy to `~/work`):
 
 ```bash
 MSYS_NO_PATHCONV=1 docker run --rm -e CI=true -v "$(pwd -W):/src:ro" cimg/go:1.27 \
   bash -c 'cp -r /src ~/work && cd ~/work && go test -race ./...'
+```
+
+Lint the GitHub workflows with actionlint, which also runs shellcheck on their scripts:
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/actionlint:latest
 ```
 
 ## CI
@@ -59,21 +67,30 @@ MSYS_NO_PATHCONV=1 docker run --rm -e CI=true -v "$(pwd -W):/src:ro" cimg/go:1.2
   and resolved review threads.
 - CircleCI logs need a CircleCI token, and `gh pr checks` only gives the outcome:
   reproduce a failing job in the image of the CI (see Commands).
-- `.github/workflows/claude-review.yml` runs a Claude review when the repository owner comments on a PR:
-  `/claude review` posts a review only, `/claude review and approve` also approves when no Critical
+- `.github/workflows/claude-review.yml` runs a Claude review when the repository owner starts a PR comment with
+  `/claude review`, which posts a review only, or `/claude review and approve`, which also approves when no Critical
   or Important point is found. It needs the `BOT_APP_ID`, `BOT_APP_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` secrets.
-  GitHub runs it from `main` only: changes to the workflow take effect once merged.
+  GitHub runs it from `main` only: changes to the workflow take effect once merged,
+  and the PR that carries them is reviewed by the previous version.
+- claude-code-action forbids Claude to submit reviews: Claude only writes `review.json`, and a step of the workflow
+  posts it, pinned to the reviewed commit, with an event that the job allows. That step stays inline in the workflow,
+  and a `review.json` shipped by the PR is removed beforehand: the jobs check out the head of the PR,
+  whose files must never decide an approval.
 
 ## Pull requests
 
 - A change goes through an issue, a branch linked to it, and a PR that closes the issue:
   `gh issue develop <n> --base main --name <branch> --checkout` creates and checks out the linked branch.
 - The approval of the review bot satisfies the protection of `main`, but any push dismisses it:
-  comment `/claude review and approve` again after the last push, before merging.
+  after the last push, comment again `MSYS_NO_PATHCONV=1 gh pr comment <pr> --body "/claude review and approve"`.
+  Without the variable, Git Bash turns the command into `C:/env/git/claude review and approve`.
 - Answer each inline review comment in its thread with `Fixed in <sha>`, which the next review counts as resolved:
   `gh api -X POST repos/corebreaker/gitserve/pulls/<pr>/comments/<id>/replies -F body=@<file>`.
-- Merge with `gh pr merge <pr> --merge`, a merge commit as for the previous PRs,
-  then delete the branch, which GitHub keeps after a merge.
+  The merge also needs every thread resolved, through the `resolveReviewThread` GraphQL mutation
+  on the thread ids that the `reviewThreads` of the PR give.
+- Merge with `gh pr merge <pr> --merge`, a merge commit, or with `--squash` when the user asks to combine commits,
+  then delete the branch, which GitHub keeps after a merge. After a squash, `git branch -d` refuses the branch:
+  delete it with `-D` once `git diff --quiet origin/main <branch>` confirms that `main` holds the same tree.
 
 ## Architecture
 
