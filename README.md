@@ -1,3 +1,7 @@
+[![CircleCI]](https://circleci.com/gh/corebreaker/gitserve/tree/main)
+[![Go Version]](https://github.com/corebreaker/gitserve/blob/main/go.mod)
+[![License]](https://github.com/corebreaker/gitserve/blob/main/LICENSE)
+
 # gitserve
 _A little http server for Git_
 
@@ -32,3 +36,7 @@ cd gitserve
 # Notices
 
 Create a repository with `git init --bare`
+
+[CircleCI]: https://img.shields.io/circleci/build/github/corebreaker/gitserve/main?style=for-the-badge
+[Go Version]: https://img.shields.io/github/go-mod/go-version/corebreaker/gitserve?style=for-the-badge
+[License]: https://img.shields.io/github/license/corebreaker/gitserve?style=for-the-badge

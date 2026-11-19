@@ -95,10 +95,10 @@ jobs:
                additions.
             5. Analyse the changes along these axes: correctness (logic, error handling,
                goroutine and channel usage, graceful shutdown, resource leaks), adherence to the
-               project conventions, performance, security (this server exposes repositories over
-               HTTP: path traversal, unintended exposure, push access), test coverage. To inspect
-               code beyond the diff, use the `Read`, `Grep` and `Glob` tools (do not run `grep`,
-               `cat` or `python3` via Bash: they are not allowed).
+               project conventions, performance, test coverage. Security is out of scope by
+               design (see `CLAUDE.md`): do not flag missing authentication, access control or
+               network restrictions. To inspect code beyond the diff, use the `Read`, `Grep` and
+               `Glob` tools (do not run `grep`, `cat` or `python3` via Bash: they are not allowed).
             6. Rank the points found by severity: **Critical** (bug/data race/security),
                **Important** (likely regression, ambiguous contract, debt that will soon block),
                **Minor** (readability, redundancy, dead code).
@@ -224,10 +224,10 @@ jobs:
                additions.
             5. Analyse the changes along these axes: correctness (logic, error handling,
                goroutine and channel usage, graceful shutdown, resource leaks), adherence to the
-               project conventions, performance, security (this server exposes repositories over
-               HTTP: path traversal, unintended exposure, push access), test coverage. To inspect
-               code beyond the diff, use the `Read`, `Grep` and `Glob` tools (do not run `grep`,
-               `cat` or `python3` via Bash: they are not allowed).
+               project conventions, performance, test coverage. Security is out of scope by
+               design (see `CLAUDE.md`): do not flag missing authentication, access control or
+               network restrictions. To inspect code beyond the diff, use the `Read`, `Grep` and
+               `Glob` tools (do not run `grep`, `cat` or `python3` via Bash: they are not allowed).
             6. Rank the points found by severity: **Critical** (bug/data race/security),
                **Important** (likely regression, ambiguous contract, debt that will soon block),
                **Minor** (readability, redundancy, dead code).
