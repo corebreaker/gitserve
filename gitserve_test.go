@@ -2,19 +2,51 @@ package main
 
 import (
 	"bytes"
-	"io"
+	"errors"
+	"io/fs"
 	"log"
-	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-billy/v6/util"
 )
 
-func TestParseArgsWithPrefix(t *testing.T) {
+// runCLI runs the command line made of args, and returns its exit status and outputs.
+func runCLI(args ...string) (int, string, string) {
+	var stdout, stderr bytes.Buffer
+	status := run(args, &stdout, &stderr)
+
+	return status, stdout.String(), stderr.String()
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent use, to capture the logs of a server running in a goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+func TestNormalizePrefix(t *testing.T) {
 	tests := []struct {
 		prefix string
 		want   string
@@ -28,179 +60,206 @@ func TestParseArgsWithPrefix(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		root, prefix, err := parseArgs([]string{"gitroot", tt.prefix})
-		if err != nil {
-			t.Fatalf("parseArgs(gitroot, %q): unexpected error: %v", tt.prefix, err)
-		}
-
-		if root != "gitroot" || prefix != tt.want {
-			t.Errorf("parseArgs(gitroot, %q) = (%q, %q), want (%q, %q)", tt.prefix, root, prefix, "gitroot", tt.want)
+		if got := normalizePrefix(tt.prefix); got != tt.want {
+			t.Errorf("normalizePrefix(%q) = %q, want %q", tt.prefix, got, tt.want)
 		}
 	}
 }
 
-func TestParseArgsWithPathOnly(t *testing.T) {
-	paths := []string{
-		"gitroot",
-		filepath.Join("nested", "gitroot"),
-		filepath.Join(t.TempDir(), "gitroot"),
-	}
-
-	for _, path := range paths {
-		abs, err := filepath.Abs(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		root, prefix, err := parseArgs([]string{path})
-		if err != nil {
-			t.Fatalf("parseArgs(%q): unexpected error: %v", path, err)
-		}
-
-		if want := filepath.Dir(abs); root != want {
-			t.Errorf("parseArgs(%q) root = %q, want %q", path, root, want)
-		}
-
-		if prefix != "/gitroot/" {
-			t.Errorf("parseArgs(%q) prefix = %q, want %q", path, prefix, "/gitroot/")
-		}
+func TestRunWithoutCommandShowsHelp(t *testing.T) {
+	status, stdout, _ := runCLI()
+	if status != 0 || !strings.Contains(stdout, "Available Commands") {
+		t.Errorf("gitserve: status %d, output %q; want status 0 and the help", status, stdout)
 	}
 }
 
-func TestParseArgsWithWrongArgumentCount(t *testing.T) {
-	for _, args := range [][]string{nil, {"gitroot", "/", "extra"}} {
-		if _, _, err := parseArgs(args); err == nil {
-			t.Errorf("parseArgs(%q): expected an error", args)
-		}
-	}
-}
-
-func TestRequestLoggerLogsStatus(t *testing.T) {
-	var logs bytes.Buffer
-
-	log.SetOutput(&logs)
-	t.Cleanup(func() { log.SetOutput(os.Stderr) })
-
+func TestRunReportsUsageErrors(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "gitroot")
 	tests := []struct {
-		name    string
-		handler http.Handler
-		want    string
+		args []string
+		want string
 	}{
-		{
-			name:    "explicit status",
-			handler: http.NotFoundHandler(),
-			want:    "GET /demo.git/info/refs (404)",
-		},
-		{
-			name: "implicit status",
-			handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				io.WriteString(w, "ok")
-			}),
-			want: "GET /demo.git/info/refs (200)",
-		},
+		{args: []string{"unknown"}, want: `unknown command "unknown"`},
+		{args: []string{"serve"}, want: "accepts 1 arg(s), received 0"},
+		{args: []string{"serve", root, "/"}, want: "accepts 1 arg(s), received 2"},
+		{args: []string{"serve", "--port", "65536", root}, want: "invalid port 65536"},
+		{args: []string{"serve", "--port", "http", root}, want: `invalid argument "http"`},
+		{args: []string{"init"}, want: "accepts 1 arg(s), received 0"},
+		{args: []string{"create", root}, want: "requires at least 2 arg(s), only received 1"},
+		{args: []string{"create", "--branch", "a..b", root, "demo"}, want: `invalid branch name "a..b"`},
+		{args: []string{"delete", root}, want: "requires at least 2 arg(s), only received 1"},
+		{args: []string{"list", "--unknown", root}, want: "unknown flag: --unknown"},
 	}
 
 	for _, tt := range tests {
-		logs.Reset()
-
-		logger := &requestLogger{next: tt.handler}
-		logger.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/demo.git/info/refs", nil))
-
-		if !strings.Contains(logs.String(), tt.want) {
-			t.Errorf("%s: log %q does not contain %q", tt.name, logs.String(), tt.want)
+		status, _, stderr := runCLI(tt.args...)
+		if status != 2 || !strings.Contains(stderr, tt.want) || !strings.Contains(stderr, "--help' for usage") {
+			t.Errorf("gitserve %s: status %d, error output %q; want status 2 and an error containing %q",
+				strings.Join(tt.args, " "), status, stderr, tt.want)
 		}
+	}
+
+	if _, err := os.Stat(root); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a command ran despite a usage error, and created the store (stat error: %v)", err)
 	}
 }
 
-func TestServeReturnsServeError(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestRunInitCreatesEmptyStore(t *testing.T) {
+	for _, kind := range storeKinds {
+		t.Run(kind.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "missing", "parent", "store"+kind.ext)
+			status, stdout, stderr := runCLI("init", path)
+			if status != 0 || stdout != "Initialized empty store "+path+"\n" {
+				t.Fatalf("init: status %d, output %q, error output %q", status, stdout, stderr)
+			}
 
-	listener.Close()
+			if status, stdout, stderr := runCLI("list", path); status != 0 || stdout != "" {
+				t.Errorf("list: status %d, output %q, error output %q; want an empty list", status, stdout, stderr)
+			}
 
-	// No signal is ever sent: serve must return on its own, without leaving its goroutine blocked.
-	served := make(chan error, 1)
-	go func() { served <- serve(&http.Server{}, listener, make(chan os.Signal)) }()
-
-	select {
-	case err := <-served:
-		if err == nil {
-			t.Fatal("serve returned nil, want the error from Serve")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("serve did not return after Serve failed")
+			if status, _, stderr := runCLI("init", path); status != 1 || !strings.Contains(stderr, "already exists") {
+				t.Errorf("second init: status %d, error output %q; want status 1 and an error", status, stderr)
+			}
+		})
 	}
 }
 
-func TestServeWaitsForInFlightRequests(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+func TestRunManagesRepositories(t *testing.T) {
+	for _, kind := range storeKinds {
+		t.Run(kind.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "store"+kind.ext)
+
+			// Creating repositories initializes the missing store.
+			status, stdout, stderr := runCLI("create", path, "demo.git", "team/tools")
+			want := "Initialized empty store " + path + "\nCreated repository demo.git\nCreated repository team/tools\n"
+			if status != 0 || stdout != want {
+				t.Fatalf("create: status %d, output %q, error output %q; want output %q", status, stdout, stderr, want)
+			}
+
+			// A failure on a repository does not prevent creating the others.
+			status, stdout, stderr = runCLI("create", "-b", "trunk", path, "demo", "other")
+			if status != 1 || stdout != "Created repository other\n" ||
+				!strings.Contains(stderr, "gitserve: repository demo.git already exists") {
+				t.Fatalf("create with a conflict: status %d, output %q, error output %q", status, stdout, stderr)
+			}
+
+			st, err := openStore(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if head := readStoreFile(t, st, "other/HEAD"); head != "ref: refs/heads/trunk\n" {
+				t.Errorf("HEAD of the repository created with --branch trunk: %q", head)
+			}
+
+			if status, stdout, _ := runCLI("list", path); status != 0 || stdout != "demo.git\nother\nteam/tools\n" {
+				t.Fatalf("list: status %d, output %q", status, stdout)
+			}
+
+			// As the server does, delete finds a repository by its name without the .git suffix.
+			status, stdout, stderr = runCLI("delete", path, "demo", "missing")
+			if status != 1 || stdout != "Deleted repository demo.git\n" ||
+				!strings.Contains(stderr, "gitserve: repository not found: missing") {
+				t.Fatalf("delete: status %d, output %q, error output %q", status, stdout, stderr)
+			}
+
+			if status, stdout, _ := runCLI("list", path); status != 0 || stdout != "other\nteam/tools\n" {
+				t.Errorf("list after delete: status %d, output %q", status, stdout)
+			}
+		})
+	}
+}
+
+func TestRunFailsOnMissingStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.zip")
+	for _, args := range [][]string{{"list", path}, {"delete", path, "demo"}} {
+		status, _, stderr := runCLI(args...)
+		if status != 1 || !strings.Contains(stderr, "does not exist") {
+			t.Errorf("gitserve %s: status %d, error output %q; want status 1 and an error",
+				strings.Join(args, " "), status, stderr)
+		}
 	}
 
-	started := make(chan struct{})
-	release := make(chan struct{})
-	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(started)
-		<-release
-		io.WriteString(w, "done")
-	})}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a command created the missing store (stat error: %v)", err)
+	}
+}
 
+func TestRunServerInitializesAndServesStore(t *testing.T) {
+	logs := &syncBuffer{}
+	log.SetOutput(logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	path := filepath.Join(t.TempDir(), "repos.zip")
 	stop := make(chan os.Signal, 1)
 	served := make(chan error, 1)
-	go func() { served <- serve(server, listener, stop) }()
+	go func() { served <- runServer(path, "127.0.0.1:0", "/git/", stop) }()
 
-	type response struct {
-		body string
-		err  error
+	port := waitForLog(t, logs, regexp.MustCompile(`on port (\d+)`))
+	if !strings.Contains(logs.String(), "Initialized empty store "+path) {
+		t.Errorf("logs %q do not report the initialization of the store", logs.String())
 	}
 
-	responses := make(chan response, 1)
-	go func() {
-		resp, err := http.Get("http://" + listener.Addr().String() + "/")
-		if err != nil {
-			responses <- response{err: err}
-			return
-		}
-		defer resp.Body.Close()
+	// A repository created by another command while the server is running gets served.
+	st, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-		body, err := io.ReadAll(resp.Body)
-		responses <- response{body: string(body), err: err}
-	}()
+	if _, err := st.createRepositories([]string{"demo"}, "main"); err != nil {
+		t.Fatal(err)
+	}
 
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the request never reached the handler")
+	resp, err := http.Get("http://127.0.0.1:" + port + "/git/demo/info/refs?service=git-upload-pack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("references of the new repository: status %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 
 	stop <- os.Interrupt
 
 	select {
 	case err := <-served:
-		t.Fatalf("serve returned while a request was still in flight (error: %v)", err)
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	close(release)
-
-	select {
-	case got := <-responses:
-		if got.err != nil || got.body != "done" {
-			t.Fatalf("in-flight request: body %q, error %v; want body %q", got.body, got.err, "done")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the in-flight request never completed")
-	}
-
-	select {
-	case err := <-served:
 		if err != nil {
-			t.Fatalf("serve: %v", err)
+			t.Fatalf("runServer: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("serve did not return after the shutdown")
+		t.Fatal("runServer did not return after the signal")
 	}
+}
+
+// waitForLog waits for pattern to match logs, and returns its first submatch.
+func waitForLog(t *testing.T, logs *syncBuffer, pattern *regexp.Regexp) string {
+	t.Helper()
+
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if match := pattern.FindStringSubmatch(logs.String()); match != nil {
+			return match[1]
+		}
+	}
+
+	t.Fatalf("logs %q do not match %q", logs.String(), pattern)
+	return ""
+}
+
+// readStoreFile returns the content of the file at name in the store.
+func readStoreFile(t *testing.T, st *store, name string) string {
+	t.Helper()
+
+	var data []byte
+	err := st.view(func(fsys billy.Filesystem) error {
+		var err error
+		data, err = util.ReadFile(fsys, name)
+
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return string(data)
 }
