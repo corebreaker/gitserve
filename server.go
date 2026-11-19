@@ -191,8 +191,7 @@ func (h *gitHandler) run(ctx context.Context, fsys billy.Filesystem, req gitRequ
 					return nil
 				}
 
-				// go-git gives io.Discard for progress when the response has no side-band channel.
-				multiplexed = info.Progress != io.Discard
+				multiplexed = hasSideBand(info)
 				saveErr = h.store.persist()
 
 				return saveErr
@@ -205,6 +204,13 @@ func (h *gitHandler) run(ctx context.Context, fsys billy.Filesystem, req gitRequ
 	}
 
 	return err
+}
+
+// hasSideBand reports whether the response to a push, which a post-receive hook gets info for, has a side-band
+// channel. go-git documents the progress writer of the hook as io.Discard when it has none. reportNotSaved depends
+// on this behavior, which TestHasSideBand checks against the version of go-git in use.
+func hasSideBand(info *transport.PostReceiveInfo) bool {
+	return info.Progress != io.Discard
 }
 
 // reportNotSaved replaces the response to a push whose archive could not be saved with an error,

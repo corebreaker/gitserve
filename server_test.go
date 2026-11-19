@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,9 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v6"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/transport"
+	"github.com/go-git/go-git/v6/utils/ioutil"
 )
 
 func TestGitHandlerRoutesRequests(t *testing.T) {
@@ -222,6 +226,58 @@ func TestGitHandlerRejectsInvalidGzipBody(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("invalid gzip body: status %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+// TestHasSideBand checks the behavior of go-git that hasSideBand depends on, against real pushes:
+// an upgrade of go-git that changed it fails here, instead of silently turning the message of reportNotSaved
+// into an HTTP error.
+func TestHasSideBand(t *testing.T) {
+	tests := []struct {
+		capabilities string
+		want         bool
+	}{
+		{capabilities: "report-status side-band-64k", want: true},
+		{capabilities: "report-status side-band", want: true},
+		{capabilities: "report-status side-band-64k no-progress", want: false},
+		{capabilities: "report-status", want: false},
+	}
+
+	const branch = "refs/heads/doomed"
+	const tip = "0123456789012345678901234567890123456789"
+	for _, tt := range tests {
+		t.Run(tt.capabilities, func(t *testing.T) {
+			storage, err := openRepository(newRepositories(t, "demo"), "demo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer storage.Close()
+
+			if err := storage.SetReference(plumbing.NewHashReference(branch, plumbing.NewHash(tip))); err != nil {
+				t.Fatal(err)
+			}
+
+			// A push that deletes the branch, which carries no packfile.
+			command := tip + " " + strings.Repeat("0", len(tip)) + " " + branch + "\x00" + tt.capabilities + "\n"
+			request := fmt.Sprintf("%04x%s0000", 4+len(command), command)
+
+			called, got := false, false
+			err = transport.ReceivePack(context.Background(), storage, io.NopCloser(strings.NewReader(request)),
+				ioutil.WriteNopCloser(io.Discard), &transport.ReceivePackRequest{
+					StatelessRPC: true,
+					Hooks: transport.ReceivePackHooks{
+						PostReceive: func(_ context.Context, info *transport.PostReceiveInfo) error {
+							called, got = true, hasSideBand(info)
+							return nil
+						},
+					},
+				})
+
+			if err != nil || !called || got != tt.want {
+				t.Errorf("push: hook called %v, hasSideBand %v, error %v; want hasSideBand %v",
+					called, got, err, tt.want)
+			}
+		})
 	}
 }
 
