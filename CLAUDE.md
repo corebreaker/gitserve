@@ -84,6 +84,9 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
 - The approval of the review bot satisfies the protection of `main`, but any push dismisses it:
   after the last push, comment again `MSYS_NO_PATHCONV=1 gh pr comment <pr> --body "/claude review and approve"`.
   Without the variable, Git Bash turns the command into `C:/env/git/claude review and approve`.
+- To follow a review, take the first run of `gh run list --workflow claude-review.yml --event issue_comment`
+  created after the command, since each comment of the bot starts a skipped run too.
+  Poll `gh run view <id> --json status` until it completes: `gh run watch` may return before the end of the run.
 - Answer each inline review comment in its thread with `Fixed in <sha>`, which the next review counts as resolved:
   `gh api -X POST repos/corebreaker/gitserve/pulls/<pr>/comments/<id>/replies -F body=@<file>`.
   The merge also needs every thread resolved, through the `resolveReviewThread` GraphQL mutation
