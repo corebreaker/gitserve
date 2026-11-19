@@ -64,8 +64,8 @@ jobs:
             You are a code-review expert. Before any analysis, read `CLAUDE.md` at the repository
             root and strictly apply the conventions it describes: English-only code, identifiers,
             comments and documentation; standard Go formatting (`gofmt`, checked by the CI); the
-            Git protocol is delegated to `github.com/AaronO/go-git-http` and must not be
-            reimplemented.
+            Git protocol is implemented by go-git (`github.com/go-git/go-git/v6`), to which gitserve
+            only routes the smart HTTP requests: it must not be reimplemented.
 
             Review PR #${{ github.event.issue.number }}:
 
@@ -193,8 +193,8 @@ jobs:
             You are a code-review expert. Before any analysis, read `CLAUDE.md` at the repository
             root and strictly apply the conventions it describes: English-only code, identifiers,
             comments and documentation; standard Go formatting (`gofmt`, checked by the CI); the
-            Git protocol is delegated to `github.com/AaronO/go-git-http` and must not be
-            reimplemented.
+            Git protocol is implemented by go-git (`github.com/go-git/go-git/v6`), to which gitserve
+            only routes the smart HTTP requests: it must not be reimplemented.
 
             Review PR #${{ github.event.issue.number }}:
 
