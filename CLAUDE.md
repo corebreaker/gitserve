@@ -27,7 +27,7 @@ Conversation with the user happens in French.
 ```bash
 go build -o . .                     # build the ./gitserve binary
 go vet ./...                        # static checks
-go test ./...                       # run all tests; the end-to-end test needs git, and is skipped without it
+go test ./...                       # all tests; the end-to-end tests need git (skipped without it, except on CI)
 go test -run TestServe ./...        # run only the tests matching a regexp
 ./gitserve create gitroot my-repo   # create a bare repository in the gitroot directory
 ./gitserve serve gitroot            # serve ./gitroot on port 8085 (foreground)
@@ -73,7 +73,10 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   GitHub runs it from `main` only: changes to the workflow take effect once merged,
   and the PR that carries them is reviewed by the previous version.
 - To check a change of the review workflow once merged, open a draft PR holding an empty commit
-  (`git commit --allow-empty`), comment each command, and close the PR without merging once its run is over.
+  (`git commit --allow-empty`), comment each command, and close the PR without merging once its run is over;
+  a comment review still lands on a PR closed during its run.
+- Auto mode may refuse to validate, commit or push a change of the review workflow, which governs the approval
+  of `main`: prepare the change, and give the user the commands to run.
 - claude-code-action forbids Claude to submit reviews: Claude only writes `review.json`, and a step of the workflow
   posts it, pinned to the reviewed commit, with an event that the job allows. That step stays inline in the workflow,
   and a `review.json` shipped by the PR is removed beforehand: the jobs check out the head of the PR,
@@ -83,6 +86,9 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
 
 - A change goes through an issue, a branch linked to it, and a PR that closes the issue:
   `gh issue develop <n> --base main --name <branch> --checkout` creates and checks out the linked branch.
+- Write each paragraph and bullet of an issue, PR or comment on one line: GitHub renders their line breaks.
+- Record lasting lessons in CLAUDE.md within the PR of the work that taught them, never in a PR of their own:
+  each PR costs a full review cycle.
 - The approval of the review bot satisfies the protection of `main`, but any push dismisses it:
   after the last push, comment again `MSYS_NO_PATHCONV=1 gh pr comment <pr> --body "/claude review and approve"`.
   Without the variable, Git Bash turns the command into `C:/env/git/claude review and approve`.
