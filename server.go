@@ -261,12 +261,6 @@ func (rec *statusRecorder) WriteHeader(code int) {
 	rec.ResponseWriter.WriteHeader(code)
 }
 
-// Unwrap returns the wrapped http.ResponseWriter, so that http.ResponseController reaches its features,
-// such as flushing.
-func (rec *statusRecorder) Unwrap() http.ResponseWriter {
-	return rec.ResponseWriter
-}
-
 // requestLogger logs every request with the status code of its response.
 type requestLogger struct {
 	next http.Handler

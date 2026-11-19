@@ -258,17 +258,6 @@ func TestReportNotSaved(t *testing.T) {
 	}
 }
 
-func TestStatusRecorderFlushes(t *testing.T) {
-	rec := httptest.NewRecorder()
-	if err := http.NewResponseController(&statusRecorder{ResponseWriter: rec}).Flush(); err != nil {
-		t.Fatalf("Flush through statusRecorder: %v", err)
-	}
-
-	if !rec.Flushed {
-		t.Error("statusRecorder did not flush the wrapped response writer")
-	}
-}
-
 func TestRequestLoggerLogsStatus(t *testing.T) {
 	var logs bytes.Buffer
 

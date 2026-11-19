@@ -80,8 +80,7 @@ In Git Bash, prefix commands with `MSYS_NO_PATHCONV=1`, otherwise an argument su
 - The command line (`gitserve.go`) uses cobra: `serve`, `init`, `create`, `delete` and `list`.
   `run` returns the exit status: 2 for a usage error, detected as an error raised before the command runs,
   and 1 when the command fails.
-- `requestLogger` wraps the handler with a `statusRecorder` that captures the status code, to log each request;
-  `statusRecorder.Unwrap` lets `http.ResponseController` reach the wrapped writer.
+- `requestLogger` wraps the handler with a `statusRecorder` that captures the status code, to log each request.
 - The server listens on `:<port>`, 8085 by default. On SIGINT or SIGTERM, `serve` shuts the server down gracefully:
   in-flight requests get 5 s, then `server.Close` releases the rest. `serve` returns only once the shutdown is over,
   then `runServer` waits for an archive write in progress (`store.close`).
