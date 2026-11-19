@@ -72,6 +72,8 @@ MSYS_NO_PATHCONV=1 docker run --rm -v "$(pwd -W):/repo" --workdir /repo rhysd/ac
   or Important point is found. It needs the `BOT_APP_ID`, `BOT_APP_KEY` and `CLAUDE_CODE_OAUTH_TOKEN` secrets.
   GitHub runs it from `main` only: changes to the workflow take effect once merged,
   and the PR that carries them is reviewed by the previous version.
+- To check a change of the review workflow once merged, open a draft PR holding an empty commit
+  (`git commit --allow-empty`), comment each command, and close the PR without merging once its run is over.
 - claude-code-action forbids Claude to submit reviews: Claude only writes `review.json`, and a step of the workflow
   posts it, pinned to the reviewed commit, with an event that the job allows. That step stays inline in the workflow,
   and a `review.json` shipped by the PR is removed beforehand: the jobs check out the head of the PR,
