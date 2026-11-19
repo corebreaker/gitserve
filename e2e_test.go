@@ -156,16 +156,17 @@ func TestGitClientEndToEnd(t *testing.T) {
 				t.Fatalf("fetched tag v1 at %s, want %s", tag, head)
 			}
 
-			// Push a new branch, then delete it.
+			// Push a new branch, then delete it. go-git advertises the references in the order the filesystem lists
+			// them, which git does not rely on: sort them.
 			g.run(first, "push", "-q", "origin", "local:feature")
 			feature := g.run(first, "rev-parse", "local")
 			want := feature + "\trefs/heads/feature\n" + head + "\trefs/heads/main"
-			if refs := g.run(work, "ls-remote", "--heads", url); refs != want {
+			if refs := g.run(work, "ls-remote", "--heads", "--sort=refname", url); refs != want {
 				t.Fatalf("remote branches after pushing feature:\n%s\nwant:\n%s", refs, want)
 			}
 
 			g.run(second, "push", "-q", "origin", "--delete", "feature")
-			if refs := g.run(work, "ls-remote", "--heads", url); refs != head+"\trefs/heads/main" {
+			if refs := g.run(work, "ls-remote", "--heads", "--sort=refname", url); refs != head+"\trefs/heads/main" {
 				t.Fatalf("remote branches after deleting feature:\n%s", refs)
 			}
 
